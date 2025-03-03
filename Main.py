@@ -1,512 +1,719 @@
 #!/usr/bin/env python3
 import sys
 import re
-from collections import Counter
+import os
+import json
+import argparse
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Union, Optional, Tuple, Any
+from enum import Enum, auto
+import readline  # For command history
 
-def parse_query(query: str) -> dict:
-    """
-    Parse a user query in our DSL and return a dictionary describing:
-      - command (FIND, COUNT, EXTRACT)
-      - target (LINES, WORDS)
-      - conditions (list of dicts: {type, value, quantifier, logic_connector, exclude, ...})
-      - modifiers (ignore_case, multiline, dotall, whole_word)
-      - extraction_pattern (only if command=EXTRACT)
-    """
+# Define the core query model using dataclasses for clarity
+class CommandType(Enum):
+    FIND = auto()
+    COUNT = auto()
+    EXTRACT = auto()
 
-    # Convert to uppercase for keyword detection, but keep original for capturing phrases
-    q_upper = query.upper()
+class TargetType(Enum):
+    LINES = auto()
+    WORDS = auto()
 
-    # Default structure
-    result = {
-        "command": None,            # FIND | COUNT | EXTRACT
-        "target": "LINES",          # LINES | WORDS
-        "conditions": [],           # each condition is a dict
-        "modifiers": {
-            "ignore_case": False,
-            "multiline": False,
-            "dotall": False,
-            "whole_word": False
-        },
-        "extraction_pattern": None  # only used if command=EXTRACT
+class ConditionType(Enum):
+    CONTAINS = auto()
+    STARTS_WITH = auto()
+    ENDS_WITH = auto()
+    MATCHES = auto()  # Regex match
+    REPEAT = auto()   # Repeat patterns
+
+class LogicType(Enum):
+    AND = auto()
+    OR = auto()
+
+@dataclass
+class Condition:
+    type: ConditionType
+    value: str
+    negated: bool = False
+    logic: LogicType = LogicType.AND
+    quantifier: Optional[str] = None  # For repeat conditions
+
+@dataclass
+class Modifiers:
+    ignore_case: bool = False
+    multiline: bool = False
+    dotall: bool = False
+    whole_word: bool = False
+    context_lines: int = 0
+
+@dataclass
+class Query:
+    command: CommandType = CommandType.FIND
+    target: TargetType = TargetType.LINES
+    conditions: List[Condition] = field(default_factory=list)
+    modifiers: Modifiers = field(default_factory=Modifiers)
+    extraction_pattern: Optional[str] = None
+    file_pattern: Optional[str] = None
+    output_format: str = "text"
+
+# Token-based parser for more reliable parsing
+class TokenType(Enum):
+    KEYWORD = auto()
+    STRING = auto()
+    NUMBER = auto()
+    OPERATOR = auto()
+    IDENTIFIER = auto()
+    EOF = auto()
+
+@dataclass
+class Token:
+    type: TokenType
+    value: str
+    line: int
+    column: int
+
+class Parser:
+    """A simple recursive descent parser for our query language"""
+    
+    KEYWORDS = {
+        "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", 
+        "LINES", "WORDS", "CONTAINS", "STARTS", "ENDS", "WITH",
+        "MATCHES", "IGNORE", "CASE", "WHOLE", "WORD", "EXTRACT",
+        "COUNT", "BEFORE", "AFTER", "CONTEXT", "AS", "JSON", "CSV",
+        "AT", "LEAST", "MOST", "EXACTLY", "BETWEEN", "TIMES"
     }
-
-    # 1. Detect command
-    if "FIND" in q_upper:
-        result["command"] = "FIND"
-    if "COUNT" in q_upper:
-        # If both FIND and COUNT appear, we can either prioritize the first found
-        # or do something else. We'll just override if we see COUNT after FIND.
-        result["command"] = "COUNT"
-    if "EXTRACT" in q_upper:
-        result["command"] = "EXTRACT"
-
-    # If no command found, default to FIND
-    if not result["command"]:
-        result["command"] = "FIND"
-
-    # 2. Detect target
-    if "WORDS" in q_upper:
-        result["target"] = "WORDS"
-    # default is LINES
-
-    # 3. Detect modifiers
-    if "IGNORE CASE" in q_upper:
-        result["modifiers"]["ignore_case"] = True
-    if "MULTILINE" in q_upper:
-        result["modifiers"]["multiline"] = True
-    if "DOTALL" in q_upper:
-        result["modifiers"]["dotall"] = True
-    if "WHOLE WORD" in q_upper:
-        result["modifiers"]["whole_word"] = True
-
-    # 4. If command=EXTRACT, detect the pattern after "EXTRACT"
-    #    e.g. "EXTRACT '(\d+)' FROM LINES THAT CONTAIN 'ID'"
-    #    We'll do a naive approach: look for EXTRACT "some pattern" or EXTRACT REGEX "some pattern"
-    if result["command"] == "EXTRACT":
-        # find text after "EXTRACT"
-        m = re.search(r'EXTRACT\s+"([^"]+)"', query, re.IGNORECASE)
-        if m:
-            result["extraction_pattern"] = m.group(1)
-        else:
-            # also check EXTRACT REGEX "..."
-            m2 = re.search(r'EXTRACT\s+REGEX\s+"([^"]+)"', query, re.IGNORECASE)
-            if m2:
-                result["extraction_pattern"] = m2.group(1)
-
-    # 5. Parse conditions
-    #    We'll look for patterns like:
-    #      - STARTS WITH "..."
-    #      - ENDS WITH "..."
-    #      - CONTAINS "..."
-    #      - REGEX "..."
-    #      - AT LEAST X TIMES "..."
-    #      - EXACTLY X TIMES "..."
-    #      - AT MOST X TIMES "..."
-    #      - BETWEEN X AND Y TIMES "..."
-    #    Also handle logic connectors (AND, OR) and excludes (BUT NOT, EXCEPT).
-
-    # We'll define a small internal parser: we’ll split the query by recognized keywords,
-    # then we’ll re-find them in context. In a real DSL, you'd do a more robust parse.
-    # For demonstration, let's do a big search for each known pattern.
-
-    # We gather conditions in a list. Each condition is a dict with:
-    # {
-    #   "type": "start"|"end"|"contains"|"regex"|"repeat",
-    #   "text": "abc" or a pattern,
-    #   "quantifier": "{2,}" or None,
-    #   "logic": "AND"|"OR",
-    #   "exclude": False|True
-    # }
-
-    # We'll do multiple passes or a single pass with multiple regex searches, whichever is simpler.
-
-    # A. Find all quoted texts
-    quoted_texts = re.findall(r'"([^"]+)"', query)
-
-    # B. We'll scan for known phrases
-    # We'll keep a simple pointer to the quoted_texts as we find patterns
-    # We also track logic connectors (AND, OR) and excludes
-    # This is a naive approach but workable for demonstration.
-
-    # We'll break the query into segments by these keywords to find them in sequence.
-    tokens = re.split(r'(\bAND\b|\bOR\b|\bBUT NOT\b|\bEXCEPT\b)', query, flags=re.IGNORECASE)
-    # tokens might look like ["FIND LINES THAT START WITH ", "AND", " ENDS WITH ", ...]
-
-    # We'll define some helper regex patterns to detect the condition type
-    re_start = re.compile(r'\bSTARTS WITH\b', re.IGNORECASE)
-    re_end = re.compile(r'\bENDS WITH\b', re.IGNORECASE)
-    re_contains = re.compile(r'\bCONTAINS\b', re.IGNORECASE)
-    re_regex = re.compile(r'\bREGEX\b', re.IGNORECASE)
-    re_at_least = re.compile(r'\bAT\s+LEAST\s+(\d+)\s+TIMES?\b', re.IGNORECASE)
-    re_at_most = re.compile(r'\bAT\s+MOST\s+(\d+)\s+TIMES?\b', re.IGNORECASE)
-    re_exactly = re.compile(r'\bEXACTLY\s+(\d+)\s+TIMES?\b', re.IGNORECASE)
-    re_between = re.compile(r'\bBETWEEN\s+(\d+)\s+AND\s+(\d+)\s+TIMES?\b', re.IGNORECASE)
-
-    logic_for_next_condition = "AND"  # default
-
-    # We'll parse each token, looking for a recognized condition phrase.
-    # Then we try to assign the next quoted text to that condition.
-    # We do a pointer to the quoted_texts we haven't used yet.
-    quoted_idx = 0
-
-    def next_quoted_text():
-        nonlocal quoted_idx
-        if quoted_idx < len(quoted_texts):
-            txt = quoted_texts[quoted_idx]
-            quoted_idx += 1
-            return txt
-        return None
-
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-
-        # Check for logic connectors
-        if re.match(r'\bAND\b', token, re.IGNORECASE):
-            logic_for_next_condition = "AND"
-            i += 1
-            continue
-        if re.match(r'\bOR\b', token, re.IGNORECASE):
-            logic_for_next_condition = "OR"
-            i += 1
-            continue
-        if re.match(r'\bBUT NOT\b', token, re.IGNORECASE) or re.match(r'\bEXCEPT\b', token, re.IGNORECASE):
-            logic_for_next_condition = "AND"
-            # We'll treat this as an exclude flag for the next condition(s).
-            # We'll parse the next tokens to see what the condition is.
-            i += 1
-            # The next condition we parse, we'll set exclude=True
-            # But we still need to see what the user typed next. We'll do a small parse:
-            # We'll look at the next token to see if it matches a known pattern or if we just
-            # treat the next quoted text as an exclude "contains".
-            # Let's do a quick peek:
-            if i < len(tokens):
-                sub = tokens[i]
-                cond_type = None
-                q_text = None
-                quantifier = None
-
-                # Detect if the next segment says "contains" or "regex" etc.
-                if re_start.search(sub):
-                    cond_type = "start"
-                    q_text = next_quoted_text()
-                elif re_end.search(sub):
-                    cond_type = "end"
-                    q_text = next_quoted_text()
-                elif re_contains.search(sub):
-                    cond_type = "contains"
-                    q_text = next_quoted_text()
-                elif re_regex.search(sub):
-                    cond_type = "regex"
-                    q_text = next_quoted_text()
+    
+    def __init__(self, query_text: str):
+        self.text = query_text
+        self.tokens = self._tokenize(query_text)
+        self.pos = 0
+        self.current_token = self.tokens[0] if self.tokens else None
+        
+    def _tokenize(self, text: str) -> List[Token]:
+        """Convert query text to a list of tokens"""
+        tokens = []
+        i = 0
+        line = 1
+        column = 1
+        
+        while i < len(text):
+            # Skip whitespace
+            if text[i].isspace():
+                if text[i] == '\n':
+                    line += 1
+                    column = 1
                 else:
-                    # Possibly a quantifier pattern
-                    match_at_least = re_at_least.search(sub)
-                    match_at_most = re_at_most.search(sub)
-                    match_exactly_ = re_exactly.search(sub)
-                    match_between_ = re_between.search(sub)
-
-                    if match_at_least:
-                        cond_type = "repeat"
-                        min_n = match_at_least.group(1)
-                        quantifier = f"{{{min_n},}}"
-                        q_text = next_quoted_text()
-                    elif match_at_most:
-                        cond_type = "repeat"
-                        max_n = match_at_most.group(1)
-                        quantifier = f"{{0,{max_n}}}"
-                        q_text = next_quoted_text()
-                    elif match_exactly_:
-                        cond_type = "repeat"
-                        exact_n = match_exactly_.group(1)
-                        quantifier = f"{{{exact_n}}}"
-                        q_text = next_quoted_text()
-                    elif match_between_:
-                        cond_type = "repeat"
-                        low_n = match_between_.group(1)
-                        high_n = match_between_.group(2)
-                        quantifier = f"{{{low_n},{high_n}}}"
-                        q_text = next_quoted_text()
+                    column += 1
+                i += 1
+                continue
+                
+            # Handle quoted strings
+            if text[i] in ('"', "'"):
+                quote_char = text[i]
+                start = i
+                i += 1
+                while i < len(text) and text[i] != quote_char:
+                    if text[i] == '\\' and i + 1 < len(text):
+                        i += 2  # Skip escaped character
                     else:
-                        # If none of these recognized, we assume "contains"
-                        cond_type = "contains"
-                        q_text = next_quoted_text()
-
-                if cond_type and q_text:
-                    condition = {
-                        "type": cond_type,
-                        "text": q_text,
-                        "quantifier": quantifier,
-                        "logic": logic_for_next_condition,
-                        "exclude": True
-                    }
-                    result["conditions"].append(condition)
-                    i += 1
+                        i += 1
+                if i < len(text):
+                    value = text[start+1:i]  # Extract without quotes
+                    tokens.append(Token(TokenType.STRING, value, line, column))
+                    column += (i - start + 1)
+                    i += 1  # Skip closing quote
                 else:
+                    raise SyntaxError(f"Unterminated string at line {line}, column {column}")
+                continue
+                
+            # Handle numbers
+            if text[i].isdigit():
+                start = i
+                while i < len(text) and text[i].isdigit():
                     i += 1
-            continue
-
-        # If the token itself might have a condition
-        cond_type = None
-        q_text = None
+                value = text[start:i]
+                tokens.append(Token(TokenType.NUMBER, value, line, column))
+                column += (i - start)
+                continue
+                
+            # Handle keywords and identifiers
+            if text[i].isalpha() or text[i] == '_':
+                start = i
+                while i < len(text) and (text[i].isalnum() or text[i] == '_'):
+                    i += 1
+                value = text[start:i]
+                if value.upper() in self.KEYWORDS:
+                    tokens.append(Token(TokenType.KEYWORD, value.upper(), line, column))
+                else:
+                    tokens.append(Token(TokenType.IDENTIFIER, value, line, column))
+                column += (i - start)
+                continue
+                
+            # Handle operators
+            if text[i] in "=<>!&|":
+                start = i
+                while i < len(text) and text[i] in "=<>!&|":
+                    i += 1
+                value = text[start:i]
+                tokens.append(Token(TokenType.OPERATOR, value, line, column))
+                column += (i - start)
+                continue
+                
+            # Skip other characters
+            i += 1
+            column += 1
+            
+        # Add EOF token
+        tokens.append(Token(TokenType.EOF, "", line, column))
+        return tokens
+    
+    def _advance(self):
+        """Move to the next token"""
+        self.pos += 1
+        if self.pos < len(self.tokens):
+            self.current_token = self.tokens[self.pos]
+        else:
+            self.current_token = self.tokens[-1]  # EOF token
+            
+    def _expect(self, token_type: TokenType, value: str = None) -> Token:
+        """Expect a token of a specific type and optionally value"""
+        if self.current_token.type != token_type:
+            raise SyntaxError(f"Expected {token_type.name}, got {self.current_token.type.name} "
+                             f"at line {self.current_token.line}, column {self.current_token.column}")
+        if value and self.current_token.value != value:
+            raise SyntaxError(f"Expected '{value}', got '{self.current_token.value}' "
+                             f"at line {self.current_token.line}, column {self.current_token.column}")
+        token = self.current_token
+        self._advance()
+        return token
+    
+    def _optional(self, token_type: TokenType, value: str = None) -> Optional[Token]:
+        """Optionally consume a token if it matches"""
+        if self.current_token.type == token_type and (value is None or self.current_token.value == value):
+            token = self.current_token
+            self._advance()
+            return token
+        return None
+    
+    def parse(self) -> Query:
+        """Parse the query and return a Query object"""
+        query = Query()
+        
+        # Parse: SELECT [LINES|WORDS|COUNT|EXTRACT "pattern"]
+        self._expect(TokenType.KEYWORD, "SELECT")
+        
+        # Check for COUNT or EXTRACT
+        if self._optional(TokenType.KEYWORD, "COUNT"):
+            query.command = CommandType.COUNT
+        elif self._optional(TokenType.KEYWORD, "EXTRACT"):
+            query.command = CommandType.EXTRACT
+            # Get the extraction pattern
+            pattern_token = self._expect(TokenType.STRING)
+            query.extraction_pattern = pattern_token.value
+        
+        # Parse target type (LINES or WORDS)
+        if self._optional(TokenType.KEYWORD, "LINES"):
+            query.target = TargetType.LINES
+        elif self._optional(TokenType.KEYWORD, "WORDS"):
+            query.target = TargetType.WORDS
+        else:
+            # Default to LINES if not specified
+            query.target = TargetType.LINES
+            
+        # Parse: FROM [filename]
+        self._expect(TokenType.KEYWORD, "FROM")
+        file_token = self._expect(TokenType.STRING) if self.current_token.type == TokenType.STRING else None
+        if file_token:
+            query.file_pattern = file_token.value
+            
+        # Parse: WHERE condition
+        if self._optional(TokenType.KEYWORD, "WHERE"):
+            query.conditions = self._parse_conditions()
+            
+        # Parse modifiers
+        self._parse_modifiers(query)
+            
+        # Parse output format
+        if self._optional(TokenType.KEYWORD, "AS"):
+            if self._optional(TokenType.KEYWORD, "JSON"):
+                query.output_format = "json"
+            elif self._optional(TokenType.KEYWORD, "CSV"):
+                query.output_format = "csv"
+                
+        return query
+        
+    def _parse_conditions(self) -> List[Condition]:
+        """Parse WHERE clause conditions"""
+        conditions = []
+        
+        # Parse first condition
+        condition = self._parse_condition()
+        conditions.append(condition)
+        
+        # Parse any additional conditions with AND/OR
+        while self.current_token.type == TokenType.KEYWORD and self.current_token.value in ("AND", "OR"):
+            logic = LogicType.AND if self.current_token.value == "AND" else LogicType.OR
+            self._advance()
+            
+            # Handle NOT keyword
+            negated = False
+            if self._optional(TokenType.KEYWORD, "NOT"):
+                negated = True
+                
+            next_condition = self._parse_condition()
+            next_condition.logic = logic
+            next_condition.negated = negated
+            conditions.append(next_condition)
+            
+        return conditions
+        
+    def _parse_condition(self) -> Condition:
+        """Parse a single condition"""
+        # Default
+        condition_type = ConditionType.CONTAINS
+        
+        # Check for specific condition types
+        if self._optional(TokenType.KEYWORD, "CONTAINS"):
+            condition_type = ConditionType.CONTAINS
+        elif self._optional(TokenType.KEYWORD, "STARTS"):
+            self._expect(TokenType.KEYWORD, "WITH")
+            condition_type = ConditionType.STARTS_WITH
+        elif self._optional(TokenType.KEYWORD, "ENDS"):
+            self._expect(TokenType.KEYWORD, "WITH")
+            condition_type = ConditionType.ENDS_WITH
+        elif self._optional(TokenType.KEYWORD, "MATCHES"):
+            condition_type = ConditionType.MATCHES
+            
+        # Parse quantifiers (AT LEAST X TIMES, etc.)
         quantifier = None
-
-        # Detect condition
-        if re_start.search(token):
-            cond_type = "start"
-            q_text = next_quoted_text()
-        elif re_end.search(token):
-            cond_type = "end"
-            q_text = next_quoted_text()
-        elif re_contains.search(token):
-            cond_type = "contains"
-            q_text = next_quoted_text()
-        elif re_regex.search(token):
-            cond_type = "regex"
-            q_text = next_quoted_text()
-        else:
-            # Possibly a quantifier pattern
-            match_at_least = re_at_least.search(token)
-            match_at_most = re_at_most.search(token)
-            match_exactly_ = re_exactly.search(token)
-            match_between_ = re_between.search(token)
-
-            if match_at_least:
-                cond_type = "repeat"
-                min_n = match_at_least.group(1)
-                quantifier = f"{{{min_n},}}"
-                q_text = next_quoted_text()
-            elif match_at_most:
-                cond_type = "repeat"
-                max_n = match_at_most.group(1)
-                quantifier = f"{{0,{max_n}}}"
-                q_text = next_quoted_text()
-            elif match_exactly_:
-                cond_type = "repeat"
-                exact_n = match_exactly_.group(1)
-                quantifier = f"{{{exact_n}}}"
-                q_text = next_quoted_text()
-            elif match_between_:
-                cond_type = "repeat"
-                low_n = match_between_.group(1)
-                high_n = match_between_.group(2)
-                quantifier = f"{{{low_n},{high_n}}}"
-                q_text = next_quoted_text()
-
-        if cond_type and q_text:
-            condition = {
-                "type": cond_type,
-                "text": q_text,
-                "quantifier": quantifier,
-                "logic": logic_for_next_condition,
-                "exclude": False
-            }
-            result["conditions"].append(condition)
-
-        i += 1
-
-    return result
-
-def build_regex_from_condition(cond: dict, modifiers: dict) -> str:
-    """
-    Build a regex snippet from a single condition dictionary.
-    We'll combine these later with AND/OR logic.
-    Condition fields:
-      - type: "start", "end", "contains", "regex", "repeat"
-      - text: the string
-      - quantifier: e.g. "{2,}" or None
-      - exclude: bool
-      - logic: "AND" or "OR"
-    """
-
-    text_esc = re.escape(cond["text"])
-
-    # If WHOLE WORD is on, we might wrap the text in word boundaries \b
-    # But let's do that in the final assembly, or do it here if simpler.
-    # For "start" => ^text
-    # For "end" => text$
-    # For "contains" => text
-    # For "regex" => user-provided pattern
-    # For "repeat" => (?:text){quant}
-
-    if cond["type"] == "start":
-        return f"^{text_esc}"
-    elif cond["type"] == "end":
-        return f"{text_esc}$"
-    elif cond["type"] == "contains":
-        return text_esc
-    elif cond["type"] == "regex":
-        # We do not escape user text here, since it's already a raw pattern
-        return cond["text"]
-    elif cond["type"] == "repeat":
-        # e.g. (?:text){2,}
-        quant = cond["quantifier"] if cond["quantifier"] else "{1,}"
-        return f"(?:{text_esc}){quant}"
-    else:
-        return text_esc  # fallback
-
-def combine_conditions(conditions, modifiers):
-    """
-    Combine multiple conditions into a single regex pattern using lookaheads for AND,
-    alternation for OR, etc. We also handle excludes separately in the final matching step.
-    We'll build two patterns:
-      1) 'include_pattern' - everything that must appear
-      2) 'exclude_patterns' - each condition that must NOT appear
-    Because mixing excludes with lookaheads can get complicated, we'll do a 2-phase approach:
-      - Phase 1: check if line/word matches 'include_pattern'
-      - Phase 2: check that none of the 'exclude_patterns' match
-    """
-    include_parts_and = []  # for AND logic
-    include_parts_or = []   # for OR logic
-
-    # We'll group conditions by logic connector. A naive approach:
-    # If we see "OR", we group them separately from "AND."
-    # A more robust approach would parse parentheses, but let's keep it simpler.
-    # We'll do something like: all AND conditions => one big lookahead chain,
-    # all OR conditions => one big alternation. But if user typed "AND" then "OR" then "AND" again,
-    # it gets tricky. We'll approximate.
-
-    exclude_patterns = []
-
-    # We'll do a pass: if a condition has exclude=True, store in exclude_patterns.
-    # If logic=OR => store in or list, else in and list
-    # Then we'll combine them.
-
-    for cond in conditions:
-        if cond["exclude"]:
-            # build the pattern for cond
-            pat = build_regex_from_condition(cond, modifiers)
-            exclude_patterns.append(pat)
-        else:
-            # build the pattern
-            pat = build_regex_from_condition(cond, modifiers)
-            if cond["logic"] == "OR":
-                include_parts_or.append(pat)
+        if self._optional(TokenType.KEYWORD, "AT"):
+            if self._optional(TokenType.KEYWORD, "LEAST"):
+                num = self._expect(TokenType.NUMBER).value
+                self._optional(TokenType.KEYWORD, "TIMES")
+                quantifier = f"{{{num},}}"
+                condition_type = ConditionType.REPEAT
+            elif self._optional(TokenType.KEYWORD, "MOST"):
+                num = self._expect(TokenType.NUMBER).value
+                self._optional(TokenType.KEYWORD, "TIMES")
+                quantifier = f"{{0,{num}}}"
+                condition_type = ConditionType.REPEAT
+        elif self._optional(TokenType.KEYWORD, "EXACTLY"):
+            num = self._expect(TokenType.NUMBER).value
+            self._optional(TokenType.KEYWORD, "TIMES")
+            quantifier = f"{{{num}}}"
+            condition_type = ConditionType.REPEAT
+        elif self._optional(TokenType.KEYWORD, "BETWEEN"):
+            low = self._expect(TokenType.NUMBER).value
+            self._expect(TokenType.KEYWORD, "AND")
+            high = self._expect(TokenType.NUMBER).value
+            self._optional(TokenType.KEYWORD, "TIMES")
+            quantifier = f"{{{low},{high}}}"
+            condition_type = ConditionType.REPEAT
+            
+        # Get the value (pattern) for the condition
+        value_token = self._expect(TokenType.STRING)
+        
+        return Condition(
+            type=condition_type,
+            value=value_token.value,
+            quantifier=quantifier
+        )
+        
+    def _parse_modifiers(self, query: Query):
+        """Parse query modifiers"""
+        while True:
+            if self._optional(TokenType.KEYWORD, "IGNORE"):
+                if self._optional(TokenType.KEYWORD, "CASE"):
+                    query.modifiers.ignore_case = True
+                    
+            elif self._optional(TokenType.KEYWORD, "WHOLE"):
+                if self._optional(TokenType.KEYWORD, "WORD"):
+                    query.modifiers.whole_word = True
+                    
+            elif self._optional(TokenType.KEYWORD, "MULTILINE"):
+                query.modifiers.multiline = True
+                
+            elif self._optional(TokenType.KEYWORD, "DOTALL"):
+                query.modifiers.dotall = True
+                
+            elif self._optional(TokenType.KEYWORD, "CONTEXT"):
+                num = self._expect(TokenType.NUMBER).value
+                query.modifiers.context_lines = int(num)
+                
             else:
-                include_parts_and.append(pat)
+                break  # No more modifiers
 
-    # Now build a single pattern for includes
-    # For the AND part, we do a chain of lookaheads: (?=.*p1)(?=.*p2) ...
-    # Then we optionally append the OR pattern as an alternative if we have both sets.
-    # If we have only OR patterns, we just do alternation. If we have both AND and OR, we do:
-    #   "((?=.*p1)(?=.*p2).* ) | (p3|p4)"
-    # This is a bit naive but workable for a simple DSL.
-
-    if include_parts_and and include_parts_or:
-        # build the AND chain
-        and_chain = "".join(f"(?=.*{p})" for p in include_parts_and) + ".*"
-        # build the OR group
-        or_group = "|".join(include_parts_or)
-        include_pattern = f"(?:({and_chain})|({or_group}))"
-    elif include_parts_and:
-        # only AND
-        and_chain = "".join(f"(?=.*{p})" for p in include_parts_and) + ".*"
-        include_pattern = and_chain
-    elif include_parts_or:
-        # only OR
-        or_group = "|".join(include_parts_or)
-        include_pattern = f"(?:{or_group})"
-    else:
-        # no include conditions => match anything
-        include_pattern = ".*"
-
-    return include_pattern, exclude_patterns
-
-def matches_item(item: str, include_pattern: str, exclude_patterns: list, modifiers: dict) -> bool:
-    """
-    Return True if `item` satisfies the include_pattern and does NOT match any exclude_pattern.
-    """
-    flags = 0
-    if modifiers["ignore_case"]:
-        flags |= re.IGNORECASE
-    if modifiers["multiline"]:
-        flags |= re.MULTILINE
-    if modifiers["dotall"]:
-        flags |= re.DOTALL
-
-    # Check include
-    if not re.search(include_pattern, item, flags=flags):
-        return False
-
-    # Check excludes
-    for epat in exclude_patterns:
-        if re.search(epat, item, flags=flags):
-            return False
-
-    return True
-
-def process_lines(filename: str, query_data: dict):
-    """
-    The main logic for reading lines or words, matching conditions, printing or counting or extracting.
-    """
-    command = query_data["command"]
-    target = query_data["target"]
-    conditions = query_data["conditions"]
-    modifiers = query_data["modifiers"]
-    extraction_pattern = query_data["extraction_pattern"]
-
-    # Build the big patterns from conditions
-    include_pattern, exclude_patterns = combine_conditions(conditions, modifiers)
-
-    # If WHOLE WORD is set, we might wrap the entire pattern in \b ... \b
-    # or each sub-part. A simpler approach: we do a second pass at runtime:
-    # We'll do a separate function if needed. For now, let's do the naive approach:
-    if modifiers["whole_word"]:
-        # We'll anchor the entire search in \b ... \b by rewriting the include pattern
-        # and each exclude pattern. This is naive, but an example:
-        include_pattern = rf"\b(?:{include_pattern})\b"
-        exclude_patterns = [rf"\b(?:{p})\b" for p in exclude_patterns]
-
-    # Decide how to open file
-    if filename.strip():
-        fh = open(filename, "r", encoding="utf-8", errors="ignore")
-    else:
-        fh = sys.stdin
-
-    matched_count = 0
-    matched_items = []  # lines or words that matched
-
-    # For EXTRACT command, we store extracted results
-    extracted_results = []
-
-    for line in fh:
-        line_stripped = line.rstrip("\n")
-
-        if target == "WORDS":
-            # Split line into words
-            words = line_stripped.split()
-            # For each word, check match
-            for w in words:
-                if matches_item(w, include_pattern, exclude_patterns, modifiers):
-                    matched_count += 1
-                    matched_items.append(w if command != "EXTRACT" else line)  # store entire line if extracting
-                    if command == "EXTRACT" and extraction_pattern:
-                        # do extraction
-                        ex_list = re.findall(extraction_pattern, w, flags=(re.IGNORECASE if modifiers["ignore_case"] else 0))
-                        extracted_results.extend(ex_list)
-        else:
-            # LINES
-            if matches_item(line_stripped, include_pattern, exclude_patterns, modifiers):
-                matched_count += 1
-                matched_items.append(line)
-                if command == "EXTRACT" and extraction_pattern:
-                    ex_list = re.findall(extraction_pattern, line_stripped, flags=(re.IGNORECASE if modifiers["ignore_case"] else 0))
-                    extracted_results.extend(ex_list)
-
-    if filename.strip():
-        fh.close()
-
-    # Output results based on command
-    if command == "COUNT":
-        print(f"Matched {target.lower()}: {matched_count}")
-    elif command == "FIND":
-        for m in matched_items:
-            # If target=WORDS, m is the word; if target=LINES, m is the entire line
-            print(m, end="" if target == "LINES" else "\n")
-    elif command == "EXTRACT":
-        if extraction_pattern:
-            for ex in extracted_results:
-                if isinstance(ex, tuple):
-                    # if user used groups in the pattern, we get a tuple
-                    print(" ".join(ex))
+# Query builder class for constructing the regex patterns
+class QueryBuilder:
+    @staticmethod
+    def build_pattern(query: Query) -> Tuple[str, List[str]]:
+        """Build regex patterns from the query"""
+        include_parts_and = []
+        include_parts_or = []
+        exclude_patterns = []
+        
+        # Process each condition
+        for condition in query.conditions:
+            pattern = QueryBuilder._build_condition_pattern(condition, query.modifiers)
+            
+            if condition.negated:
+                exclude_patterns.append(pattern)
+            else:
+                if condition.logic == LogicType.OR:
+                    include_parts_or.append(pattern)
                 else:
-                    print(ex)
+                    include_parts_and.append(pattern)
+                    
+        # Combine patterns
+        if include_parts_and and include_parts_or:
+            # Build AND chain
+            and_chain = "".join(f"(?=.*{p})" for p in include_parts_and) + ".*"
+            # Build OR group
+            or_group = "|".join(include_parts_or)
+            include_pattern = f"(?:({and_chain})|({or_group}))"
+        elif include_parts_and:
+            # Only AND conditions
+            and_chain = "".join(f"(?=.*{p})" for p in include_parts_and) + ".*"
+            include_pattern = and_chain
+        elif include_parts_or:
+            # Only OR conditions
+            or_group = "|".join(include_parts_or)
+            include_pattern = f"(?:{or_group})"
         else:
-            # if no extraction pattern, just print matched lines or words
-            for m in matched_items:
-                print(m, end="" if target == "LINES" else "\n")
+            # No include conditions
+            include_pattern = ".*"
+            
+        # Apply whole word boundaries if needed
+        if query.modifiers.whole_word:
+            include_pattern = rf"\b(?:{include_pattern})\b"
+            exclude_patterns = [rf"\b(?:{p})\b" for p in exclude_patterns]
+            
+        return include_pattern, exclude_patterns
+        
+    @staticmethod
+    def _build_condition_pattern(condition: Condition, modifiers: Modifiers) -> str:
+        """Build regex pattern for a single condition"""
+        # Escape the text unless it's a regex pattern
+        is_regex = condition.type == ConditionType.MATCHES
+        text = condition.value if is_regex else re.escape(condition.value)
+        
+        if condition.type == ConditionType.STARTS_WITH:
+            return f"^{text}"
+        elif condition.type == ConditionType.ENDS_WITH:
+            return f"{text}$"
+        elif condition.type == ConditionType.CONTAINS:
+            return text
+        elif condition.type == ConditionType.MATCHES:
+            return text
+        elif condition.type == ConditionType.REPEAT:
+            quantifier = condition.quantifier if condition.quantifier else "{1,}"
+            return f"(?:{text}){quantifier}"
+        else:
+            return text  # Default fallback
 
+# Query executor class for processing files against queries
+class QueryExecutor:
+    @staticmethod
+    def execute(query: Query, input_source=None) -> Dict[str, Any]:
+        """Execute a query against input text data"""
+        # Set up regex flags
+        flags = 0
+        if query.modifiers.ignore_case:
+            flags |= re.IGNORECASE
+        if query.modifiers.multiline:
+            flags |= re.MULTILINE
+        if query.modifiers.dotall:
+            flags |= re.DOTALL
+            
+        # Build the regex patterns
+        include_pattern, exclude_patterns = QueryBuilder.build_pattern(query)
+        
+        # Decide the input source
+        if input_source is None:
+            if query.file_pattern and query.file_pattern.strip():
+                try:
+                    input_file = open(query.file_pattern, "r", encoding="utf-8", errors="ignore")
+                except FileNotFoundError:
+                    return {"error": f"File not found: {query.file_pattern}"}
+            else:
+                input_file = sys.stdin
+        else:
+            # Allow passing an already open file-like object
+            input_file = input_source
+        
+        # Process the input
+        results = {
+            "command": query.command.name,
+            "target": query.target.name,
+            "matched_count": 0,
+            "matched_items": [],
+            "extracted_items": []
+        }
+        
+        # Read all lines (for context line support)
+        lines = input_file.readlines()
+        
+        # If the input was a file we opened, close it
+        if input_source is None and query.file_pattern and query.file_pattern.strip():
+            input_file.close()
+            
+        # Process lines based on target type
+        if query.target == TargetType.WORDS:
+            for i, line in enumerate(lines):
+                line_stripped = line.rstrip("\n")
+                words = line_stripped.split()
+                
+                for word in words:
+                    if QueryExecutor._matches_item(word, include_pattern, exclude_patterns, flags):
+                        results["matched_count"] += 1
+                        
+                        if query.command == CommandType.FIND:
+                            results["matched_items"].append({"line": i+1, "content": word})
+                            
+                        if query.command == CommandType.EXTRACT and query.extraction_pattern:
+                            extracted = re.findall(query.extraction_pattern, word, flags=flags)
+                            for ex in extracted:
+                                if isinstance(ex, tuple):
+                                    results["extracted_items"].append(" ".join(ex))
+                                else:
+                                    results["extracted_items"].append(ex)
+        else:  # TargetType.LINES
+            for i, line in enumerate(lines):
+                line_stripped = line.rstrip("\n")
+                
+                if QueryExecutor._matches_item(line_stripped, include_pattern, exclude_patterns, flags):
+                    results["matched_count"] += 1
+                    
+                    if query.command in (CommandType.FIND, CommandType.EXTRACT):
+                        # Add context lines if specified
+                        context_lines = []
+                        
+                        if query.modifiers.context_lines > 0:
+                            # Add before lines
+                            start_idx = max(0, i - query.modifiers.context_lines)
+                            context_lines.extend([
+                                {"line": j+1, "content": lines[j].rstrip("\n"), "type": "before"}
+                                for j in range(start_idx, i)
+                            ])
+                            
+                            # Add the matched line
+                            context_lines.append({"line": i+1, "content": line_stripped, "type": "match"})
+                            
+                            # Add after lines
+                            end_idx = min(len(lines), i + query.modifiers.context_lines + 1)
+                            context_lines.extend([
+                                {"line": j+1, "content": lines[j].rstrip("\n"), "type": "after"}
+                                for j in range(i+1, end_idx)
+                            ])
+                            
+                            results["matched_items"].append({"line": i+1, "content": line_stripped, "context": context_lines})
+                        else:
+                            results["matched_items"].append({"line": i+1, "content": line_stripped})
+                    
+                    if query.command == CommandType.EXTRACT and query.extraction_pattern:
+                        extracted = re.findall(query.extraction_pattern, line_stripped, flags=flags)
+                        for ex in extracted:
+                            if isinstance(ex, tuple):
+                                results["extracted_items"].append(" ".join(ex))
+                            else:
+                                results["extracted_items"].append(ex)
+                    
+        return results
+    
+    @staticmethod
+    def _matches_item(item: str, include_pattern: str, exclude_patterns: list, flags: int) -> bool:
+        """Return True if item matches include_pattern and doesn't match any exclude_pattern"""
+        # Check include pattern
+        if not re.search(include_pattern, item, flags=flags):
+            return False
+            
+        # Check exclude patterns
+        for pattern in exclude_patterns:
+            if re.search(pattern, item, flags=flags):
+                return False
+                
+        return True
+        
+# Output formatter class for different output formats
+class OutputFormatter:
+    @staticmethod
+    def format_results(results: Dict[str, Any], format_type: str) -> str:
+        """Format results in the specified format"""
+        if format_type == "json":
+            return json.dumps(results, indent=2)
+        elif format_type == "csv":
+            # Basic CSV output
+            output = []
+            
+            # Header
+            if results["command"] == "COUNT":
+                output.append(f"Target,Count")
+                output.append(f"{results['target']},{results['matched_count']}")
+            elif results["command"] == "EXTRACT":
+                output.append(f"Item")
+                for item in results["extracted_items"]:
+                    output.append(f"{item}")
+            else:  # FIND
+                output.append(f"Line,Content")
+                for item in results["matched_items"]:
+                    output.append(f"{item['line']},\"{item['content'].replace('\"', '\"\"')}\"")
+                    
+            return "\n".join(output)
+        else:  # text (default)
+            if results["command"] == "COUNT":
+                return f"Matched {results['target'].lower()}: {results['matched_count']}"
+            elif results["command"] == "EXTRACT":
+                return "\n".join(results["extracted_items"])
+            else:  # FIND
+                output = []
+                for item in results["matched_items"]:
+                    if "context" in item:
+                        # Add separator before context blocks
+                        output.append("\n" + "-" * 40)
+                        
+                        for ctx_line in item["context"]:
+                            prefix = ""
+                            if ctx_line["type"] == "before":
+                                prefix = "- "
+                            elif ctx_line["type"] == "match":
+                                prefix = "> "
+                            elif ctx_line["type"] == "after":
+                                prefix = "+ "
+                                
+                            output.append(f"{prefix}{ctx_line['line']}: {ctx_line['content']}")
+                            
+                        # Add separator after context blocks
+                        output.append("-" * 40)
+                    else:
+                        output.append(f"{item['line']}: {item['content']}")
+                        
+                return "\n".join(output)
+
+# Interactive mode implementation
+def interactive_mode():
+    """Run the application in interactive mode"""
+    examples = [
+        "SELECT LINES FROM \"file.txt\" WHERE CONTAINS \"error\"",
+        "SELECT COUNT WORDS FROM \"log.txt\" WHERE STARTS WITH \"Exception\" IGNORE CASE",
+        "SELECT EXTRACT \"(\\d+)\" FROM \"data.csv\" WHERE CONTAINS \"ID\" CONTEXT 2",
+        "SELECT LINES WHERE MATCHES \"\\b\\d{3}-\\d{2}-\\d{4}\\b\" WHOLE WORD"  # Find SSNs
+    ]
+    
+    print("=== TextQuery Interactive Mode ===")
+    print("Enter queries or 'help' for assistance, 'exit' to quit.")
+    
+    history_file = os.path.expanduser("~/.textquery_history")
+    try:
+        readline.read_history_file(history_file)
+    except FileNotFoundError:
+        pass
+    
+    while True:
+        try:
+            query_text = input("\nQuery> ").strip()
+            
+            if not query_text:
+                continue
+                
+            if query_text.lower() == "exit":
+                break
+                
+            if query_text.lower() == "help":
+                print("\nTextQuery Help:")
+                print("  Syntax: SELECT [LINES|WORDS|COUNT|EXTRACT \"pattern\"] FROM \"file\" WHERE [conditions] [modifiers]")
+                print("\nExamples:")
+                for ex in examples:
+                    print(f"  {ex}")
+                print("\nConditions:")
+                print("  CONTAINS \"text\"           - Line/word contains text")
+                print("  STARTS WITH \"text\"        - Line/word starts with text")
+                print("  ENDS WITH \"text\"          - Line/word ends with text")
+                print("  MATCHES \"regex\"           - Line/word matches regex pattern")
+                print("  AT LEAST n TIMES \"text\"   - Text appears at least n times")
+                print("\nModifiers:")
+                print("  IGNORE CASE                - Case-insensitive matching")
+                print("  WHOLE WORD                 - Match whole words only")
+                print("  CONTEXT n                  - Show n lines before/after matches")
+                print("  AS [JSON|CSV]              - Output format")
+                continue
+                
+            # Parse and execute the query
+            try:
+                parser = Parser(query_text)
+                query = parser.parse()
+                
+                # If no file specified, use stdin with a prompt
+                if not query.file_pattern:
+                    print("Enter text (press Ctrl+D when finished):")
+                    input_text = sys.stdin.read()
+                    from io import StringIO
+                    input_source = StringIO(input_text)
+                else:
+                    input_source = None
+                    
+                results = QueryExecutor.execute(query, input_source)
+                
+                if "error" in results:
+                    print(f"Error: {results['error']}")
+                else:
+                    output = OutputFormatter.format_results(results, query.output_format)
+                    print("\nResults:")
+                    print(output)
+                    
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                
+        except KeyboardInterrupt:
+            print("\nOperation cancelled.")
+        except EOFError:
+            break
+            
+    # Save command history
+    readline.write_history_file(history_file)
+    print("\nExiting TextQuery. Goodbye!")
+    
+# Command-line interface
 def main():
-    print("Enter your search query (in our DSL):")
-    query = input("> ")
-    print("Enter filename to search (or leave blank for stdin):")
-    filename = input("> ")
-
-    # 1) Parse the query into a structured form
-    query_data = parse_query(query)
-
-    # 2) Process lines (or words) from the file with the query data
-    process_lines(filename, query_data)
+    parser = argparse.ArgumentParser(description="TextQuery - A text processing tool with a SQL-like query language")
+    parser.add_argument("-q", "--query", help="Query string in TextQuery language")
+    parser.add_argument("-f", "--file", help="Input file to process")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Run in interactive mode")
+    parser.add_argument("-o", "--output", choices=["text", "json", "csv"], default="text", 
+                      help="Output format")
+    
+    args = parser.parse_args()
+    
+    if args.interactive:
+        interactive_mode()
+        return
+        
+    if args.query:
+        try:
+            query_parser = Parser(args.query)
+            query = query_parser.parse()
+            
+            # Override file if specified on command line
+            if args.file:
+                query.file_pattern = args.file
+                
+            # Override output format if specified
+            if args.output:
+                query.output_format = args.output
+                
+            results = QueryExecutor.execute(query)
+            
+            if "error" in results:
+                print(f"Error: {results['error']}", file=sys.stderr)
+                sys.exit(1)
+                
+            output = OutputFormatter.format_results(results, query.output_format)
+            print(output)
+            
+        except Exception as e:
+            print(f"Error: {str(e)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        interactive_mode()
 
 if __name__ == "__main__":
     main()
