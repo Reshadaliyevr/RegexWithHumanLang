@@ -7,13 +7,18 @@ A simple command-line tool to perform text searches using a human-readable DSL (
 Run the script using Python:
 
 ```sh
-python3 humanreadableregex.py
+python3 main.py -i
 ```
 
 Or make it executable and run:
 
 ```sh
-./humanreadableregex.py
+./main.py
+```
+
+For more information you can run:
+```sh
+python main.py --help
 ```
 
 ### Example Usage
